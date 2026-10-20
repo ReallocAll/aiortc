@@ -97,6 +97,23 @@ The easiest way to install ``aiortc`` is to run:
 .. _PyPI: https://pypi.org/project/aiortc/
 .. _GitHub repository: https://github.com/aiortc/aiortc
 
+Optional transport limits
+-------------------------
+
+The local ``1.15.0+nethernet.1`` candidate pins
+``aioice==0.10.2+nethernet.1``. ``RTCConfiguration`` accepts immutable
+``sctpLimits=SctpLimits()`` and ``iceLimits=aioice.IceLimits()`` values; both
+default to ``None``. Bounded direct ICE requires ``iceServers=[]``.
+
+``RTCSctpTransport.reserve_data_channel(channel, message_sizes)`` reserves an
+entire sequence of encoded byte bounds. Its permit commits with synchronous
+``send_nowait(messages)`` and has idempotent ``release()``.
+``reserve_data_channel_nowait`` raises ``BufferError`` instead of waiting.
+Ordinary data-channel sends also obey configured storage limits. Reservations,
+queued messages and retained SCTP chunks share one budget. Gap acknowledgements
+do not release retained payload; removal or terminal teardown does. Existing
+``bufferedAmount`` semantics are unchanged.
+
 License
 -------
 

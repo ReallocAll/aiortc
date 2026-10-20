@@ -8,7 +8,12 @@ from .mediastreams import (
     MediaStreamTrack,
     VideoStreamTrack,
 )
-from .rtcconfiguration import RTCBundlePolicy, RTCConfiguration, RTCIceServer
+from .rtcconfiguration import (
+    RTCBundlePolicy,
+    RTCConfiguration,
+    RTCIceServer,
+    SctpLimits,
+)
 from .rtcdatachannel import RTCDataChannel, RTCDataChannelParameters
 from .rtcdtlstransport import (
     RTCCertificate,
@@ -50,12 +55,13 @@ from .stats import (
     RTCTransportStats,
 )
 
-__version__ = "1.15.0"
+__version__ = "1.15.0+nethernet.1"
 
 # Set default logging handler to avoid "No handler found" warnings.
 logging.getLogger(__name__).addHandler(logging.NullHandler())
 
 __all__ = [
+    "SctpLimits",
     "AudioStreamTrack",
     "InvalidAccessError",
     "InvalidStateError",

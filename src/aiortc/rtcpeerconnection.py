@@ -212,6 +212,8 @@ def create_media_description_for_sctp(
 
     media.rtp.muxId = mid
     media.sctpCapabilities = sctp.getCapabilities()
+    if sctp._limits is not None:
+        media.sctpCapabilities.maxMessageSize = sctp._limits.max_message_size
     add_transport_description(media, sctp.transport)
 
     return media
@@ -315,10 +317,11 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         self.__transceivers: list[RTCRtpTransceiver] = []
 
         self.__closeTask: Optional[asyncio.Task] = None
+        self.__connectTasks: set[asyncio.Task] = set()
         self.__connectionState = "new"
         self.__iceConnectionState = "new"
         self.__iceGatheringState = "new"
-        self.__isClosed: Optional[asyncio.Future[bool]] = None
+        self.__isClosed = False
         self.__signalingState = "stable"
 
         self.__currentLocalDescription: Optional[sdp.SessionDescription] = None
@@ -514,11 +517,26 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         """
         Terminate the ICE agent, ending ICE processing and streams.
         """
-        if self.__isClosed:
-            await self.__isClosed
-            return
-        self.__isClosed = asyncio.Future()
-        self.__setSignalingState("closed")
+        self.__requestClose()
+        await asyncio.shield(self.__closeTask)
+
+    def __requestClose(self) -> None:
+        if not self.__isClosed:
+            self.__isClosed = True
+            self.__setSignalingState("closed")
+            self.__closeTask = asyncio.create_task(self.__close())
+            self.__closeTask.add_done_callback(self.__closeDone)
+
+    def __closeDone(self, task: asyncio.Task) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def __close(self) -> None:
+        tasks = list(self.__connectTasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         # stop senders / receivers
         for transceiver in self.__transceivers:
@@ -542,8 +560,6 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         # no more events will be emitted, so remove all event listeners
         # to facilitate garbage collection.
         self.remove_all_listeners()
-
-        self.__isClosed.set_result(True)
 
     async def createAnswer(self) -> RTCSessionDescription:
         """
@@ -865,7 +881,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 add_transport_description(media, self.__sctp.transport)
 
         # connect
-        asyncio.ensure_future(self.__connect())
+        self.__scheduleConnect()
 
         # replace description
         if description.type == "answer":
@@ -1054,7 +1070,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             self.emit("track", event.track)
 
         # connect
-        asyncio.ensure_future(self.__connect())
+        self.__scheduleConnect()
 
         # update signaling state
         if description.type == "offer":
@@ -1070,6 +1086,8 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             self.__pendingRemoteDescription = description
 
     async def __connect(self) -> None:
+        if self.__isClosed:
+            return
         for transceiver in self.__transceivers:
             dtlsTransport = transceiver.receiver.transport
             iceTransport = dtlsTransport.transport
@@ -1106,6 +1124,20 @@ class RTCPeerConnection(AsyncIOEventEmitter):
         coros = map(lambda t: t.iceGatherer.gather(), self.__iceTransports)
         await asyncio.gather(*coros)
 
+    def __scheduleConnect(self) -> None:
+        if not self.__isClosed:
+            task = asyncio.create_task(self.__connect())
+            self.__connectTasks.add(task)
+            task.add_done_callback(self.__connectDone)
+
+    def __connectDone(self, task: asyncio.Task) -> None:
+        self.__connectTasks.discard(task)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None and not self.__isClosed:
+                self.__log_debug("Connection startup failed: %s", error)
+                self.__requestClose()
+
     def __assertNotClosed(self) -> None:
         if self.__isClosed:
             raise InvalidStateError("RTCPeerConnection is closed")
@@ -1130,9 +1162,13 @@ class RTCPeerConnection(AsyncIOEventEmitter):
                 iceServers=self.__configuration.iceServers,
                 local_username=parameters.usernameFragment,
                 local_password=parameters.password,
+                limits=self.__configuration.iceLimits,
             )
         else:
-            iceGatherer = RTCIceGatherer(iceServers=self.__configuration.iceServers)
+            iceGatherer = RTCIceGatherer(
+                iceServers=self.__configuration.iceServers,
+                limits=self.__configuration.iceLimits,
+            )
 
         iceGatherer.on("statechange", self.__updateIceGatheringState)
         iceTransport = RTCIceTransport(iceGatherer)
@@ -1162,7 +1198,9 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             dtlsTransport = self.__transceivers[0].receiver.transport
         else:
             dtlsTransport = self.__createDtlsTransport()
-        self.__sctp = RTCSctpTransport(dtlsTransport)
+        self.__sctp = RTCSctpTransport(
+            dtlsTransport, limits=self.__configuration.sctpLimits
+        )
         self.__sctp._bundled = bundled
         self.__sctp.mid = None
 
@@ -1301,7 +1339,7 @@ class RTCPeerConnection(AsyncIOEventEmitter):
             and self.__closeTask is None
             and dtlsStates == set(["closed"])
         ):
-            self.__closeTask = asyncio.ensure_future(self.close())
+            self.__requestClose()
 
     def __updateIceConnectionState(self) -> None:
         # compute new state

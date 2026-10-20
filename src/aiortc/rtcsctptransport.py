@@ -6,7 +6,7 @@ import math
 import os
 import time
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Coroutine, Iterator, Sequence
 from dataclasses import dataclass, field
 from struct import pack, unpack_from
 from typing import Deque, Optional, Union, cast
@@ -15,6 +15,7 @@ from google_crc32c import value as crc32c
 from pyee.asyncio import AsyncIOEventEmitter
 
 from .exceptions import InvalidStateError
+from .rtcconfiguration import SctpLimits
 from .rtcdatachannel import RTCDataChannel, RTCDataChannelParameters
 from .rtcdtlstransport import RTCDtlsTransport
 from .utils import random32, uint16_add, uint16_gt, uint32_gt, uint32_gte
@@ -96,7 +97,58 @@ WEBRTC_BINARY = 53
 WEBRTC_STRING_EMPTY = 56
 WEBRTC_BINARY_EMPTY = 57
 
-DataChannelQueue = Deque[tuple[RTCDataChannel, int, bytes]]
+DataChannelQueue = Deque[tuple[RTCDataChannel, int, bytes, Optional["_SendCredit"]]]
+
+
+@dataclass(eq=False)
+class _SendCredit:
+    size: int
+    chunks: int
+    active: bool = True
+
+
+class SctpSendReservation:
+    """Capacity for one atomic sequence of messages on a data channel."""
+
+    def __init__(
+        self,
+        transport: "RTCSctpTransport",
+        channel: RTCDataChannel,
+        sizes: tuple[int, ...],
+    ) -> None:
+        self._transport = transport
+        self._channel = channel
+        self._sizes = sizes
+        self._bytes = sum(max(1, size) for size in sizes)
+        self._chunks = sum(
+            (max(1, size) + USERDATA_MAX_LENGTH - 1) // USERDATA_MAX_LENGTH
+            for size in sizes
+        )
+        self._active = False
+
+    def send_nowait(self, messages: Sequence[Union[bytes, str]]) -> None:
+        self._transport._check_send_channel(self._channel)
+        if not self._active:
+            raise InvalidStateError("Send reservation is no longer active")
+        if not messages or len(messages) > len(self._sizes):
+            raise ValueError("Message sequence exceeds its send reservation")
+        prepared = []
+        for data, bound in zip(messages, self._sizes):
+            protocol, user_data = self._transport._data_channel_encode(data)
+            size = 0 if data == b"" or data == "" else len(user_data)
+            if size > bound:
+                raise ValueError("Message exceeds its send reservation")
+            prepared.append((protocol, user_data))
+        self._transport._commit_reservation(self, prepared)
+
+    def release(self) -> None:
+        if self._active:
+            self._active = False
+            self._transport._send_reservations.discard(self)
+            self._transport._send_bytes -= self._bytes
+            self._transport._send_chunks -= self._chunks
+            self._transport._send_messages -= len(self._sizes)
+            self._transport._wake_senders()
 
 
 def chunk_type(chunk: "Chunk") -> str:
@@ -186,6 +238,7 @@ class DataChunk(Chunk):
     _abandoned: bool
     _book_size: int
     _expiry: Optional[float]
+    _fast_retransmitted: bool
     _max_retransmits: Optional[int]
     _misses: int
     _retransmit: bool
@@ -219,7 +272,7 @@ class DataChunk(Chunk):
                 self.stream_seq,
                 self.protocol,
             )
-            + self.user_data
+            + bytes(self.user_data)
         )
         if length % 4:
             data += b"\x00" * padl(length)
@@ -541,9 +594,16 @@ RECONFIG_PARAM_TYPES: dict[
 
 
 class InboundStream:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        max_message_size: Optional[int] = None,
+        on_remove: Optional[Callable[[DataChunk], None]] = None,
+    ) -> None:
         self.reassembly: list[DataChunk] = []
         self.sequence_number = 0
+        self._max_message_size = max_message_size
+        self._on_remove = on_remove
 
     def add_chunk(self, chunk: DataChunk) -> None:
         if not self.reassembly or uint32_gt(chunk.tsn, self.reassembly[-1].tsn):
@@ -562,6 +622,7 @@ class InboundStream:
     def pop_messages(self) -> Iterator[tuple[int, int, bytes]]:
         pos = 0
         start_pos = None
+        message_size = 0
         while pos < len(self.reassembly):
             chunk = self.reassembly[pos]
             if start_pos is None:
@@ -576,6 +637,7 @@ class InboundStream:
                     break
                 expected_tsn = chunk.tsn
                 start_pos = pos
+                message_size = 0
             elif chunk.tsn != expected_tsn:
                 if ordered:
                     break
@@ -584,16 +646,25 @@ class InboundStream:
                     pos += 1
                     continue
 
+            message_size += len(chunk.user_data)
+            if (
+                self._max_message_size is not None
+                and message_size > self._max_message_size
+            ):
+                raise ConnectionError("SCTP assembled message limit exceeded")
             if chunk.flags & SCTP_DATA_LAST_FRAG:
-                user_data = b"".join(
-                    [c.user_data for c in self.reassembly[start_pos : pos + 1]]
-                )
+                removed = self.reassembly[start_pos : pos + 1]
+                user_data = b"".join([c.user_data for c in removed])
                 self.reassembly = (
                     self.reassembly[:start_pos] + self.reassembly[pos + 1 :]
                 )
                 if ordered and chunk.stream_seq == self.sequence_number:
                     self.sequence_number = uint16_add(self.sequence_number, 1)
+                if self._on_remove is not None:
+                    for removed_chunk in removed:
+                        self._on_remove(removed_chunk)
                 pos = start_pos
+                message_size = 0
                 yield (chunk.stream_id, chunk.protocol, user_data)
             else:
                 pos += 1
@@ -613,7 +684,11 @@ class InboundStream:
             else:
                 break
 
+        removed = self.reassembly[: pos + 1]
         self.reassembly = self.reassembly[pos + 1 :]
+        if self._on_remove is not None:
+            for chunk in removed:
+                self._on_remove(chunk)
         return size
 
 
@@ -640,7 +715,13 @@ class RTCSctpTransport(AsyncIOEventEmitter):
     :param transport: An :class:`RTCDtlsTransport`.
     """
 
-    def __init__(self, transport: RTCDtlsTransport, port: int = 5000) -> None:
+    def __init__(
+        self,
+        transport: RTCDtlsTransport,
+        port: int = 5000,
+        *,
+        limits: Optional[SctpLimits] = None,
+    ) -> None:
         if transport.state == "closed":
             raise InvalidStateError
 
@@ -650,6 +731,24 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self.__started = False
         self.__state = "new"
         self.__transport = transport
+        self._limits = limits
+        self._uses_backpressure = limits is not None or getattr(
+            transport.transport, "_has_write_limits", False
+        )
+        self._stopping = False
+        self._stop_task: Optional[asyncio.Task[None]] = None
+        self._failure: Optional[ConnectionError] = None
+        self._service_tasks: dict[str, asyncio.Task[None]] = {}
+        self._flush_lock = asyncio.Lock()
+        self._sender_lock = asyncio.Lock()
+        self._send_bytes = 0
+        self._send_chunks = 0
+        self._send_messages = 0
+        self._send_credits: set[_SendCredit] = set()
+        self._send_reservations: set[SctpSendReservation] = set()
+        self._send_waiters: Deque[tuple[asyncio.Future[None], SctpSendReservation]] = (
+            deque()
+        )
 
         self._loop = asyncio.get_event_loop()
         self._hmac_key = os.urandom(16)
@@ -659,6 +758,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self._local_verification_tag = random32()
 
         self._remote_extensions: list[int] = []
+        self._remote_initial_tsn: Optional[int] = None
         self._remote_max_message_size = REMOTE_DEFAULT_MAX_MESSAGE_SIZE
         self._remote_partial_reliability = False
         self._remote_port: Optional[int] = None
@@ -673,6 +773,9 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self._sack_duplicates: list[int] = []
         self._sack_misordered: set[int] = set()
         self._sack_needed = False
+        self._inbound_bytes = 0
+        self._inbound_chunks = 0
+        self._active_inbound_streams: set[int] = set()
 
         # outbound
         self._cwnd = 3 * USERDATA_MAX_LENGTH
@@ -708,6 +811,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self._t2_failures = 0
         self._t2_handle: Optional[asyncio.TimerHandle] = None
         self._t3_handle: Optional[asyncio.TimerHandle] = None
+        self._t3_pending: Optional[asyncio.TimerHandle] = None
 
         # data channels
         self._data_channel_id: Optional[int] = None
@@ -800,10 +904,222 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         """
         Stop the transport.
         """
-        if self._association_state != self.State.CLOSED:
-            await self._abort()
-        self.__transport._unregister_data_receiver(self)
+        if self._stop_task is None:
+            self._stopping = True
+            self._stop_task = asyncio.create_task(self._stop())
+        await asyncio.shield(self._stop_task)
+
+    async def _stop(self) -> None:
+        tasks = list(self._service_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            if self._association_state != self.State.CLOSED:
+                await self._abort()
+        finally:
+            self.__transport._unregister_data_receiver(self)
+            self._set_state(self.State.CLOSED)
+
+    def _schedule(
+        self, name: str, operation: Callable[[], Coroutine[None, None, None]]
+    ) -> None:
+        if self._stopping or self.__state == "closed":
+            return
+        task = self._service_tasks.get(name)
+        if task is None or task.done():
+            task = asyncio.create_task(operation())
+            self._service_tasks[name] = task
+            task.add_done_callback(lambda done: self._service_done(name, done))
+
+    def _service_done(self, name: str, task: asyncio.Task[None]) -> None:
+        if self._service_tasks.get(name) is task:
+            self._service_tasks.pop(name, None)
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                self._fail(ConnectionError(f"SCTP send failed: {error}"))
+
+    def _fail(self, error: ConnectionError) -> None:
+        if self._failure is None:
+            self._failure = error
         self._set_state(self.State.CLOSED)
+
+    def _check_send_channel(self, channel: RTCDataChannel) -> None:
+        if self._failure is not None:
+            raise self._failure
+        if self._stopping or self.__state == "closed":
+            raise ConnectionError("SCTP transport is closed")
+        if channel.transport is not self or channel.readyState != "open":
+            raise InvalidStateError("Data channel is not open on this association")
+
+    def _has_capacity(self, size: int, chunks: int, messages: int) -> bool:
+        return self._limits is None or (
+            self._send_bytes + size <= self._limits.send_bytes
+            and self._send_chunks + chunks <= self._limits.send_chunks
+            and self._send_messages + messages <= self._limits.send_messages
+        )
+
+    async def reserve_data_channel(
+        self, channel: RTCDataChannel, message_sizes: Sequence[int]
+    ) -> SctpSendReservation:
+        """Reserve the full encoded-byte bounds before producing any messages."""
+        reservation = self._new_reservation(channel, message_sizes)
+        if not self._send_waiters and self._has_capacity(
+            reservation._bytes, reservation._chunks, len(reservation._sizes)
+        ):
+            self._grant_reservation(reservation)
+            return reservation
+        if (
+            self._limits is not None
+            and len(self._send_waiters) >= self._limits.send_waiters
+        ):
+            raise BufferError("SCTP send waiter limit exceeded")
+        future: asyncio.Future[None] = self._loop.create_future()
+        entry = (future, reservation)
+        self._send_waiters.append(entry)
+        try:
+            await future
+            return reservation
+        except BaseException:
+            if entry in self._send_waiters:
+                self._send_waiters.remove(entry)
+            reservation.release()
+            self._wake_senders()
+            raise
+
+    def reserve_data_channel_nowait(
+        self, channel: RTCDataChannel, message_sizes: Sequence[int]
+    ) -> SctpSendReservation:
+        """Reserve a whole message sequence or reject without retaining its payload."""
+        reservation = self._new_reservation(channel, message_sizes)
+        if self._send_waiters or not self._has_capacity(
+            reservation._bytes, reservation._chunks, len(reservation._sizes)
+        ):
+            raise BufferError("SCTP send storage is unavailable")
+        self._grant_reservation(reservation)
+        return reservation
+
+    def _new_reservation(
+        self, channel: RTCDataChannel, message_sizes: Sequence[int]
+    ) -> SctpSendReservation:
+        self._check_send_channel(channel)
+        if not message_sizes or (
+            self._limits is not None and len(message_sizes) > self._limits.send_messages
+        ):
+            raise ValueError("Invalid send reservation message count")
+        sizes = tuple(message_sizes)
+        for size in sizes:
+            if (
+                type(size) is not int
+                or size < 0
+                or (self._limits is not None and size > self._limits.max_message_size)
+            ):
+                raise ValueError("Invalid send reservation message size")
+            self._check_remote_message_size(size)
+        reservation = SctpSendReservation(self, channel, sizes)
+        if self._limits is not None and (
+            reservation._bytes > self._limits.send_bytes
+            or reservation._chunks > self._limits.send_chunks
+        ):
+            raise ValueError("Send reservation exceeds association capacity")
+        return reservation
+
+    def _grant_reservation(self, reservation: SctpSendReservation) -> None:
+        reservation._active = True
+        self._send_reservations.add(reservation)
+        self._send_bytes += reservation._bytes
+        self._send_chunks += reservation._chunks
+        self._send_messages += len(reservation._sizes)
+
+    def _wake_senders(self) -> None:
+        while self._send_waiters:
+            future, reservation = self._send_waiters[0]
+            if future.done():
+                self._send_waiters.popleft()
+                continue
+            try:
+                self._check_send_channel(reservation._channel)
+            except (ConnectionError, InvalidStateError) as error:
+                self._send_waiters.popleft()
+                future.set_exception(error)
+                continue
+            if not self._has_capacity(
+                reservation._bytes, reservation._chunks, len(reservation._sizes)
+            ):
+                return
+            self._send_waiters.popleft()
+            self._grant_reservation(reservation)
+            future.set_result(None)
+
+    def _commit_reservation(
+        self, reservation: SctpSendReservation, prepared: list[tuple[int, bytes]]
+    ) -> None:
+        credits = [
+            _SendCredit(len(data), math.ceil(len(data) / USERDATA_MAX_LENGTH))
+            for _, data in prepared
+        ]
+        entries = [
+            (reservation._channel, protocol, data, credit)
+            for (protocol, data), credit in zip(prepared, credits)
+        ]
+        try:
+            reservation._active = False
+            self._send_reservations.remove(reservation)
+            self._send_bytes -= reservation._bytes - sum(c.size for c in credits)
+            self._send_chunks -= reservation._chunks - sum(c.chunks for c in credits)
+            self._send_messages -= len(reservation._sizes) - len(credits)
+            self._send_credits.update(credits)
+            self._data_channel_queue.extend(entries)
+            for _, data in prepared:
+                reservation._channel._addBufferedAmount(len(data))
+            self._schedule("flush", self._data_channel_flush)
+        except BaseException:
+            self._fail(ConnectionError("SCTP message commit failed"))
+            raise
+        self._wake_senders()
+
+    def _queue_data(self, channel: RTCDataChannel, protocol: int, data: bytes) -> None:
+        credit = self._allocate_send_credit(data)
+        self._data_channel_queue.append((channel, protocol, data, credit))
+
+    def _allocate_send_credit(self, data: bytes) -> Optional[_SendCredit]:
+        if self._limits is None:
+            return None
+        size = len(data)
+        chunks = math.ceil(size / USERDATA_MAX_LENGTH)
+        if size > self._limits.max_message_size:
+            raise ValueError("SCTP message size limit exceeded")
+        if not self._has_capacity(size, chunks, 1):
+            raise BufferError("SCTP send storage limit exceeded")
+        credit = _SendCredit(size, chunks)
+        self._send_credits.add(credit)
+        self._send_bytes += size
+        self._send_chunks += chunks
+        self._send_messages += 1
+        return credit
+
+    def _release_credit(self, credit: Optional[_SendCredit]) -> None:
+        if credit is not None and credit.active:
+            credit.active = False
+            self._send_credits.discard(credit)
+            self._send_bytes -= credit.size
+            self._send_chunks -= credit.chunks
+            self._send_messages -= 1
+            self._wake_senders()
+
+    def _release_chunk(self, chunk: DataChunk) -> None:
+        credit = getattr(chunk, "_credit", None)
+        if credit is not None and credit.active:
+            chunk.user_data = b""
+            chunk._credit = None
+            credit.chunks -= 1
+            self._send_chunks -= 1
+            if credit.chunks == 0:
+                self._release_credit(credit)
+            else:
+                self._wake_senders()
 
     async def _abort(self) -> None:
         """
@@ -811,8 +1127,12 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         """
         chunk = AbortChunk()
         try:
-            await self._send_chunk(chunk)
-        except ConnectionError:
+            if self._uses_backpressure:
+                async with asyncio.timeout(0):
+                    await self._send_chunk(chunk)
+            else:
+                await self._send_chunk(chunk)
+        except (ConnectionError, TimeoutError):
             pass
 
     async def _init(self) -> None:
@@ -827,6 +1147,12 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         chunk.initial_tsn = self._local_tsn
         self._set_extensions(chunk.params)
         await self._send_chunk(chunk)
+        if (
+            self._stopping
+            or self.__state == "closed"
+            or self._association_state != self.State.CLOSED
+        ):
+            return
 
         # start T1 timer and enter COOKIE-WAIT state
         self._t1_start(chunk)
@@ -865,8 +1191,50 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         Get or create the inbound stream with the specified ID.
         """
         if stream_id not in self._inbound_streams:
-            self._inbound_streams[stream_id] = InboundStream()
+            self._inbound_streams[stream_id] = InboundStream(
+                max_message_size=(
+                    self._limits.max_message_size if self._limits is not None else None
+                ),
+                on_remove=self._release_inbound if self._limits is not None else None,
+            )
         return self._inbound_streams[stream_id]
+
+    def _release_inbound(self, chunk: DataChunk) -> None:
+        self._inbound_bytes -= len(chunk.user_data)
+        self._inbound_chunks -= 1
+        chunk.user_data = b""
+        stream = self._inbound_streams.get(chunk.stream_id)
+        if stream is None or not stream.reassembly:
+            self._active_inbound_streams.discard(chunk.stream_id)
+
+    def _admit_inbound(self, chunk: DataChunk) -> bool:
+        duplicate = (
+            uint32_gte(self._last_received_tsn, chunk.tsn)
+            or chunk.tsn in self._sack_misordered
+        )
+        if self._limits is not None:
+            retained = (
+                self._inbound_chunks
+                + len(self._sack_duplicates)
+                + len(self._sack_misordered)
+            )
+            entries = 1 if duplicate else 2
+            if retained + entries > self._limits.receive_entries:
+                raise ConnectionError("SCTP receive entry limit exceeded")
+            if not duplicate:
+                if (
+                    self._inbound_bytes + len(chunk.user_data)
+                    > self._limits.receive_bytes
+                ):
+                    raise ConnectionError("SCTP receive byte limit exceeded")
+                if (
+                    chunk.stream_id not in self._active_inbound_streams
+                    and len(self._active_inbound_streams) >= self._limits.active_streams
+                ):
+                    raise ConnectionError(
+                        "SCTP active reassembly stream limit exceeded"
+                    )
+        return duplicate
 
     def _get_timestamp(self) -> int:
         return int(time.time())
@@ -875,6 +1243,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         """
         Handle data received from the network.
         """
+        if self._stopping or self.__state == "closed":
+            return
         try:
             _, _, verification_tag, chunks = parse_packet(data)
         except ValueError:
@@ -897,7 +1267,15 @@ class RTCSctpTransport(AsyncIOEventEmitter):
 
         # handle chunks
         for chunk in chunks:
-            await self._receive_chunk(chunk)
+            try:
+                await self._receive_chunk(chunk)
+            except (ConnectionError, BufferError, ValueError) as error:
+                if self._limits is None:
+                    raise
+                self._fail(ConnectionError(f"SCTP receive failed: {error}"))
+                return
+            if self._stopping or self.__state == "closed":
+                return
 
         # send SACK if needed
         if self._sack_needed:
@@ -966,6 +1344,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         Receive data stream -> ULP.
         """
         await self._data_channel_receive(stream_id, pp_id, data)
+        if self._limits is not None:
+            await asyncio.sleep(0)
 
     async def _receive_chunk(self, chunk: Chunk) -> None:
         """
@@ -992,6 +1372,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             self._set_state(self.State.SHUTDOWN_RECEIVED)
             shutdown_ack = ShutdownAckChunk()
             await self._send_chunk(shutdown_ack)
+            if self._stopping or self.__state == "closed":
+                return
             self._t2_start(shutdown_ack)
             self._set_state(self.State.SHUTDOWN_ACK_SENT)
         elif (
@@ -1008,26 +1390,34 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                 cls = RECONFIG_PARAM_TYPES.get(param[0])
                 if cls is not None:
                     await self._receive_reconfig_param(cls.parse(param[1]))
+                    if self._stopping or self.__state == "closed":
+                        return
 
         # an INIT may collide with our own, see RFC 9260 section 5.2.1
         elif isinstance(chunk, InitChunk):
-            self._last_received_tsn = tsn_minus_one(chunk.initial_tsn)
-            self._reconfig_response_seq = tsn_minus_one(chunk.initial_tsn)
-            self._remote_verification_tag = chunk.initiate_tag
-            self._ssthresh = chunk.advertised_rwnd
-            self._get_extensions(chunk.params)
+            if not (
+                self._association_state == self.State.ESTABLISHED
+                and chunk.initiate_tag == self._remote_verification_tag
+                and chunk.initial_tsn == self._remote_initial_tsn
+            ):
+                self._remote_initial_tsn = chunk.initial_tsn
+                self._last_received_tsn = tsn_minus_one(chunk.initial_tsn)
+                self._reconfig_response_seq = tsn_minus_one(chunk.initial_tsn)
+                self._remote_verification_tag = chunk.initiate_tag
+                self._ssthresh = chunk.advertised_rwnd
+                self._get_extensions(chunk.params)
 
-            self.__log_debug(
-                "- Peer supports %d outbound streams, %d max inbound streams",
-                chunk.outbound_streams,
-                chunk.inbound_streams,
-            )
-            self._inbound_streams_count = min(
-                chunk.outbound_streams, self._inbound_streams_max
-            )
-            self._outbound_streams_count = min(
-                self._outbound_streams_count, chunk.inbound_streams
-            )
+                self.__log_debug(
+                    "- Peer supports %d outbound streams, %d max inbound streams",
+                    chunk.outbound_streams,
+                    chunk.inbound_streams,
+                )
+                self._inbound_streams_count = min(
+                    chunk.outbound_streams, self._inbound_streams_max
+                )
+                self._outbound_streams_count = min(
+                    self._outbound_streams_count, chunk.inbound_streams
+                )
 
             init_ack = InitAckChunk()
             init_ack.initiate_tag = self._local_verification_tag
@@ -1065,6 +1455,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             self._t1_cancel()
             cookie_ack = CookieAckChunk()
             await self._send_chunk(cookie_ack)
+            if self._stopping or self.__state == "closed":
+                return
             self._set_state(self.State.ESTABLISHED)
 
         elif (
@@ -1073,6 +1465,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         ):
             # cancel T1 timer and process chunk
             self._t1_cancel()
+            self._remote_initial_tsn = chunk.initial_tsn
             self._last_received_tsn = tsn_minus_one(chunk.initial_tsn)
             self._reconfig_response_seq = tsn_minus_one(chunk.initial_tsn)
             self._remote_verification_tag = chunk.initiate_tag
@@ -1097,6 +1490,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                     echo.body = v
                     break
             await self._send_chunk(echo)
+            if self._stopping or self.__state == "closed":
+                return
 
             # start T1 timer and enter COOKIE-ECHOED state
             self._t1_start(echo)
@@ -1121,21 +1516,33 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         """
         Handle a DATA chunk.
         """
-        self._sack_needed = True
+        try:
+            self._admit_inbound(chunk)
+            self._sack_needed = True
 
-        # mark as received
-        if self._mark_received(chunk.tsn):
-            return
+            # mark as received
+            if self._mark_received(chunk.tsn):
+                return
 
-        # find stream
-        inbound_stream = self._get_inbound_stream(chunk.stream_id)
+            # find stream
+            inbound_stream = self._get_inbound_stream(chunk.stream_id)
+            if self._limits is not None:
+                self._inbound_bytes += len(chunk.user_data)
+                self._inbound_chunks += 1
+                self._active_inbound_streams.add(chunk.stream_id)
 
-        # defragment data
-        inbound_stream.add_chunk(chunk)
-        self._advertised_rwnd -= len(chunk.user_data)
-        for message in inbound_stream.pop_messages():
-            self._advertised_rwnd += len(message[2])
-            await self._receive(*message)
+            # defragment data
+            inbound_stream.add_chunk(chunk)
+            self._advertised_rwnd -= len(chunk.user_data)
+            for message in inbound_stream.pop_messages():
+                self._advertised_rwnd += len(message[2])
+                await self._receive(*message)
+                if self._stopping or self.__state == "closed":
+                    return
+        except ConnectionError as error:
+            if self._limits is not None:
+                self._fail(error)
+            raise
 
     async def _receive_forward_tsn_chunk(self, chunk: ForwardTsnChunk) -> None:
         """
@@ -1172,6 +1579,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             for message in inbound_stream.pop_messages():
                 self._advertised_rwnd += len(message[2])
                 await self._receive(*message)
+                if self._stopping or self.__state == "closed":
+                    return
 
         # prune obsolete chunks
         for stream_id, inbound_stream in self._inbound_streams.items():
@@ -1183,8 +1592,17 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         """
         Handle a SACK chunk.
         """
+        async with self._sender_lock:
+            if self._stopping or self.__state == "closed":
+                return
+            if not self._update_sack(chunk):
+                return
+        await self._data_channel_flush()
+        await self._transmit()
+
+    def _update_sack(self, chunk: SackChunk) -> bool:
         if uint32_gt(self._last_sacked_tsn, chunk.cumulative_tsn):
-            return
+            return False
 
         received_time = time.time()
         self._last_sacked_tsn = chunk.cumulative_tsn
@@ -1205,6 +1623,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             # update RTO estimate
             if done == 1 and schunk._sent_count == 1:
                 self._update_rto(received_time - schunk._sent_time)
+            self._release_chunk(schunk)
 
         # handle gap blocks
         loss = False
@@ -1230,10 +1649,11 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             for schunk in self._sent_queue:
                 if uint32_gt(schunk.tsn, highest_newly_acked):
                     break
-                if schunk.tsn not in seen:
+                if schunk.tsn not in seen and not schunk._fast_retransmitted:
                     schunk._misses += 1
                     if schunk._misses == 3:
                         schunk._misses = 0
+                        schunk._fast_retransmitted = True
                         if not self._maybe_abandon(schunk):
                             schunk._retransmit = True
 
@@ -1271,8 +1691,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             self._t3_restart()
 
         self._update_advanced_peer_ack_point()
-        await self._data_channel_flush()
-        await self._transmit()
+        return True
 
     async def _receive_reconfig_param(
         self,
@@ -1288,7 +1707,11 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         if isinstance(param, StreamResetOutgoingParam):
             # mark closed inbound streams
             for stream_id in param.streams:
-                self._inbound_streams.pop(stream_id, None)
+                stream = self._inbound_streams.pop(stream_id, None)
+                if self._limits is not None and stream is not None:
+                    for chunk in stream.reassembly:
+                        self._advertised_rwnd += len(chunk.user_data)
+                        self._release_inbound(chunk)
 
                 # close data channel
                 channel = self._data_channels.get(stream_id)
@@ -1338,12 +1761,35 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         """
         Send data ULP -> stream.
         """
+        self._enqueue_sctp(
+            stream_id, pp_id, user_data, expiry, max_retransmits, ordered
+        )
+        del user_data
+        await self._transmit()
+
+    def _enqueue_sctp(
+        self,
+        stream_id: int,
+        pp_id: int,
+        user_data: bytes,
+        expiry: Optional[float] = None,
+        max_retransmits: Optional[int] = None,
+        ordered: bool = True,
+        credit: Optional[_SendCredit] = None,
+    ) -> None:
+        if self._stopping or self.__state == "closed":
+            raise ConnectionError("SCTP transport is closed")
+        if self._limits is not None and credit is None:
+            if not user_data:
+                raise ValueError("SCTP message size limit exceeded")
+            credit = self._allocate_send_credit(user_data)
         if ordered:
             stream_seq = self._outbound_stream_seq.get(stream_id, 0)
         else:
             stream_seq = 0
 
         fragments = math.ceil(len(user_data) / USERDATA_MAX_LENGTH)
+        payload = memoryview(user_data) if credit is not None else user_data
         pos = 0
         for fragment in range(0, fragments):
             chunk = DataChunk()
@@ -1358,7 +1804,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             chunk.stream_id = stream_id
             chunk.stream_seq = stream_seq
             chunk.protocol = pp_id
-            chunk.user_data = user_data[pos : pos + USERDATA_MAX_LENGTH]
+            chunk.user_data = payload[pos : pos + USERDATA_MAX_LENGTH]
+            chunk._credit = credit
 
             # FIXME: dynamically added attributes, mypy can't handle them
             # initialize counters
@@ -1366,6 +1813,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             chunk._acked = False
             chunk._book_size = len(chunk.user_data)
             chunk._expiry = expiry
+            chunk._fast_retransmitted = False
             chunk._max_retransmits = max_retransmits
             chunk._misses = 0
             chunk._retransmit = False
@@ -1378,9 +1826,6 @@ class RTCSctpTransport(AsyncIOEventEmitter):
 
         if ordered:
             self._outbound_stream_seq[stream_id] = uint16_add(stream_seq, 1)
-
-        # transmit outbound data
-        await self._transmit()
 
     async def _send_chunk(self, chunk: Chunk) -> None:
         """
@@ -1450,12 +1895,31 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             for channel in list(self._data_channels.values()):
                 if channel.negotiated and channel.readyState != "open":
                     channel._setReadyState("open")
-            asyncio.ensure_future(self._data_channel_flush())
+            self._schedule("flush", self._data_channel_flush)
         elif state == self.State.CLOSED:
             self._t1_cancel()
             self._t2_cancel()
             self._t3_cancel()
             self.__state = "closed"
+            for task in self._service_tasks.values():
+                if task is not asyncio.current_task():
+                    task.cancel()
+            self._data_channel_queue.clear()
+            self._outbound_queue.clear()
+            self._sent_queue.clear()
+            self._inbound_streams.clear()
+            self._sack_misordered.clear()
+            self._sack_duplicates.clear()
+            self._active_inbound_streams.clear()
+            self._inbound_bytes = self._inbound_chunks = 0
+            for reservation in self._send_reservations:
+                reservation._active = False
+            self._send_reservations.clear()
+            for credit in self._send_credits:
+                credit.active = False
+            self._send_credits.clear()
+            self._send_bytes = self._send_chunks = self._send_messages = 0
+            self._wake_senders()
 
             # close data channels
             for stream_id in list(self._data_channels.keys()):
@@ -1475,6 +1939,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             self._t1_chunk = None
 
     def _t1_expired(self) -> None:
+        if self._stopping or self.__state == "closed":
+            return
         self._t1_failures += 1
         self._t1_handle = None
         self.__log_debug(
@@ -1483,7 +1949,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         if self._t1_failures > SCTP_MAX_INIT_RETRANS:
             self._set_state(self.State.CLOSED)
         else:
-            asyncio.ensure_future(self._send_chunk(self._t1_chunk))
+            chunk = self._t1_chunk
+            self._schedule("timer1", lambda: self._send_chunk(chunk))
             self._t1_handle = self._loop.call_later(self._rto, self._t1_expired)
 
     def _t1_start(self, chunk: Chunk) -> None:
@@ -1501,6 +1968,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             self._t2_chunk = None
 
     def _t2_expired(self) -> None:
+        if self._stopping or self.__state == "closed":
+            return
         self._t2_failures += 1
         self._t2_handle = None
         self.__log_debug(
@@ -1509,7 +1978,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         if self._t2_failures > SCTP_MAX_ASSOCIATION_RETRANS:
             self._set_state(self.State.CLOSED)
         else:
-            asyncio.ensure_future(self._send_chunk(self._t2_chunk))
+            chunk = self._t2_chunk
+            self._schedule("timer2", lambda: self._send_chunk(chunk))
             self._t2_handle = self._loop.call_later(self._rto, self._t2_expired)
 
     def _t2_start(self, chunk: ShutdownAckChunk) -> None:
@@ -1520,7 +1990,30 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self._t2_handle = self._loop.call_later(self._rto, self._t2_expired)
 
     def _t3_expired(self) -> None:
-        self._t3_handle = None
+        if self._stopping or self.__state == "closed":
+            return
+        if not self._uses_backpressure:
+            self._t3_handle = None
+            self._update_t3()
+            self._schedule("transmit", self._transmit)
+        elif self._t3_handle is not None:
+            self._t3_pending = self._t3_handle
+            self._schedule("timer3", self._run_t3)
+
+    async def _run_t3(self) -> None:
+        while self._t3_pending is not None:
+            expired = self._t3_pending
+            self._t3_pending = None
+            async with self._sender_lock:
+                if self._stopping or self.__state == "closed":
+                    return
+                if self._t3_handle is not expired:
+                    continue
+                self._t3_handle = None
+                self._update_t3()
+                await self._transmit_locked()
+
+    def _update_t3(self) -> None:
         self.__log_debug("x T3 expired")
 
         # mark retransmit or abandoned chunks
@@ -1537,13 +2030,12 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self._ssthresh = max(self._cwnd // 2, 4 * USERDATA_MAX_LENGTH)
         self._cwnd = USERDATA_MAX_LENGTH
 
-        asyncio.ensure_future(self._transmit())
-
     def _t3_restart(self) -> None:
         self.__log_debug("- T3 restart")
         if self._t3_handle is not None:
             self._t3_handle.cancel()
             self._t3_handle = None
+        self._t3_pending = None
         self._t3_handle = self._loop.call_later(self._rto, self._t3_expired)
 
     def _t3_start(self) -> None:
@@ -1552,6 +2044,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         self._t3_handle = self._loop.call_later(self._rto, self._t3_expired)
 
     def _t3_cancel(self) -> None:
+        self._t3_pending = None
         if self._t3_handle is not None:
             self.__log_debug("- T3 cancel")
             self._t3_handle.cancel()
@@ -1561,9 +2054,17 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         """
         Transmit outbound data.
         """
+        async with self._sender_lock:
+            await self._transmit_locked()
+
+    async def _transmit_locked(self) -> None:
+        if self._stopping or self.__state == "closed":
+            return
         # send FORWARD TSN
         if self._forward_tsn_chunk is not None:
             await self._send_chunk(self._forward_tsn_chunk)
+            if self._stopping or self.__state == "closed":
+                return
             self._forward_tsn_chunk = None
 
             # ensure T3 is running
@@ -1591,6 +2092,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                 chunk._retransmit = False
                 chunk._sent_count += 1
                 await self._send_chunk(chunk)
+                if self._stopping or self.__state == "closed":
+                    return
                 if retransmit_earliest:
                     # restart the T3 timer as the earliest outstanding TSN
                     # is being retransmitted
@@ -1607,6 +2110,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             chunk._sent_time = time.time()
 
             await self._send_chunk(chunk)
+            if self._stopping or self.__state == "closed":
+                return
             if not self._t3_handle:
                 self._t3_start()
 
@@ -1644,6 +2149,7 @@ class RTCSctpTransport(AsyncIOEventEmitter):
             done += 1
             if not (chunk.flags & SCTP_DATA_UNORDERED):
                 streams[chunk.stream_id] = chunk.stream_seq
+            self._release_chunk(chunk)
 
         if done:
             # build FORWARD TSN
@@ -1676,25 +2182,33 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                 # queue a stream reset
                 self._reconfig_queue.append(channel.id)
                 if len(self._reconfig_queue) == 1:
-                    asyncio.ensure_future(self._transmit_reconfig())
+                    self._schedule("reconfig", self._transmit_reconfig)
             else:
                 # remove any queued messages for the datachannel
                 new_queue: DataChannelQueue = deque()
                 for queue_item in self._data_channel_queue:
                     if queue_item[0] != channel:
                         new_queue.append(queue_item)
+                    else:
+                        self._release_credit(queue_item[3])
                 self._data_channel_queue = new_queue
 
                 # mark the datachannel as closed
                 if channel.id is not None:
                     self._data_channels.pop(channel.id)
                 channel._setReadyState("closed")
+            self._wake_senders()
 
     def _data_channel_closed(self, stream_id: int) -> None:
         channel = self._data_channels.pop(stream_id)
         channel._setReadyState("closed")
+        self._wake_senders()
 
     async def _data_channel_flush(self) -> None:
+        async with self._flush_lock:
+            await self._data_channel_flush_locked()
+
+    async def _data_channel_flush_locked(self) -> None:
         """
         Try to flush buffered data to the SCTP layer.
 
@@ -1702,11 +2216,11 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         whether we are a client or a server to correctly assign an odd/even ID
         to the data channels.
         """
-        if self._association_state != self.State.ESTABLISHED:
+        if self._association_state != self.State.ESTABLISHED or self._stopping:
             return
 
         while self._data_channel_queue and not self._outbound_queue:
-            channel, protocol, user_data = self._data_channel_queue.popleft()
+            channel, protocol, user_data, credit = self._data_channel_queue.popleft()
 
             # register channel if necessary
             stream_id = channel.id
@@ -1718,22 +2232,29 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                 channel._setId(stream_id)
 
             # send data
+            size = len(user_data)
             if protocol == WEBRTC_DCEP:
-                await self._send(stream_id, protocol, user_data)
+                self._enqueue_sctp(stream_id, protocol, user_data, credit=credit)
             else:
                 if channel.maxPacketLifeTime:
                     expiry = time.time() + (channel.maxPacketLifeTime / 1000)
                 else:
                     expiry = None
-                await self._send(
+                self._enqueue_sctp(
                     stream_id,
                     protocol,
                     user_data,
                     expiry=expiry,
                     max_retransmits=channel.maxRetransmits,
                     ordered=channel.ordered,
+                    credit=credit,
                 )
-                channel._addBufferedAmount(-len(user_data))
+            del user_data
+            await self._transmit()
+            if self._stopping or self.__state == "closed":
+                return
+            if protocol != WEBRTC_DCEP:
+                channel._addBufferedAmount(-size)
 
     def _data_channel_add_negotiated(self, channel: RTCDataChannel) -> None:
         if channel.id in self._data_channels:
@@ -1777,8 +2298,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         )
         data += channel.label.encode("utf8")
         data += channel.protocol.encode("utf8")
-        self._data_channel_queue.append((channel, WEBRTC_DCEP, data))
-        asyncio.ensure_future(self._data_channel_flush())
+        self._queue_data(channel, WEBRTC_DCEP, data)
+        self._schedule("flush", self._data_channel_flush)
 
     async def _data_channel_receive(
         self, stream_id: int, pp_id: int, data: bytes
@@ -1824,10 +2345,10 @@ class RTCSctpTransport(AsyncIOEventEmitter):
                 self._data_channels[stream_id] = channel
 
                 # send ack
-                self._data_channel_queue.append(
-                    (channel, WEBRTC_DCEP, pack("!B", DATA_CHANNEL_ACK))
-                )
+                self._queue_data(channel, WEBRTC_DCEP, pack("!B", DATA_CHANNEL_ACK))
                 await self._data_channel_flush()
+                if self._stopping or self.__state == "closed":
+                    return
 
                 # emit channel
                 self.emit("datachannel", channel)
@@ -1851,6 +2372,22 @@ class RTCSctpTransport(AsyncIOEventEmitter):
     def _data_channel_send(
         self, channel: RTCDataChannel, data: Union[bytes, str]
     ) -> None:
+        self._check_send_channel(channel)
+        pp_id, user_data = self._data_channel_encode(data)
+        self._queue_data(channel, pp_id, user_data)
+        channel._addBufferedAmount(len(user_data))
+        self._schedule("flush", self._data_channel_flush)
+
+    def _check_remote_message_size(self, size: int) -> None:
+        if self._remote_max_message_size and size > self._remote_max_message_size:
+            raise ValueError(
+                f"Cannot send message of {size} bytes, the remote party "
+                f"only supports messages up to {self._remote_max_message_size} bytes"
+            )
+
+    def _data_channel_encode(self, data: Union[bytes, str]) -> tuple[int, bytes]:
+        if not isinstance(data, (str, bytes)):
+            raise ValueError(f"Cannot send unsupported data type: {type(data)}")
         if data == "":
             pp_id, user_data = WEBRTC_STRING_EMPTY, b"\x00"
         elif isinstance(data, str):
@@ -1860,19 +2397,8 @@ class RTCSctpTransport(AsyncIOEventEmitter):
         else:
             pp_id, user_data = WEBRTC_BINARY, data
 
-        # A maximum message size of 0 means the remote party can handle
-        # messages of any size.
-        if self._remote_max_message_size and (
-            len(user_data) > self._remote_max_message_size
-        ):
-            raise ValueError(
-                f"Cannot send message of {len(user_data)} bytes, the remote party "
-                f"only supports messages up to {self._remote_max_message_size} bytes"
-            )
-
-        channel._addBufferedAmount(len(user_data))
-        self._data_channel_queue.append((channel, pp_id, user_data))
-        asyncio.ensure_future(self._data_channel_flush())
+        self._check_remote_message_size(len(user_data))
+        return pp_id, user_data
 
     class State(enum.Enum):
         CLOSED = 1

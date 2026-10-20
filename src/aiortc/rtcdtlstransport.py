@@ -364,6 +364,7 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         self._state = State.NEW
         self._stats_id = "transport_" + str(id(self))
         self._task: Optional[asyncio.Future[None]] = None
+        self._stop_task: Optional[asyncio.Task[None]] = None
         self._transport = transport
 
         # counters
@@ -550,9 +551,14 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
         """
         Stop and close the DTLS transport.
         """
-        if self._task is not None:
-            self._task.cancel()
-            self._task = None
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(self._stop(asyncio.current_task()))
+        await asyncio.shield(self._stop_task)
+
+    async def _stop(self, caller: Optional[asyncio.Task]) -> None:
+        reader = self._task
+        if reader is not None and reader is not caller:
+            reader.cancel()
 
         if self._ssl and self._state in [State.CONNECTING, State.CONNECTED]:
             try:
@@ -560,10 +566,18 @@ class RTCDtlsTransport(AsyncIOEventEmitter):
             except SSL.Error:
                 pass
             try:
-                await self._write_ssl()
-            except ConnectionError:
+                if getattr(self.transport, "_has_write_limits", False):
+                    async with asyncio.timeout(0):
+                        await self._write_ssl()
+                else:
+                    await self._write_ssl()
+            except (ConnectionError, TimeoutError):
                 pass
             self.__log_debug("- DTLS shutdown complete")
+        if reader is not None and reader is not caller:
+            await asyncio.gather(reader, return_exceptions=True)
+        if self._task is reader:
+            self._task = None
 
     async def __run(self) -> None:
         try:

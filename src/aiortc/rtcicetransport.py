@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from aioice import Candidate, Connection, ConnectionClosed
+from aioice import Candidate, Connection, ConnectionClosed, IceLimits
 from pyee.asyncio import AsyncIOEventEmitter
 
 from .exceptions import InvalidStateError
@@ -186,6 +186,8 @@ class RTCIceGatherer(AsyncIOEventEmitter):
         iceServers: Optional[list[RTCIceServer]] = None,
         local_username: Optional[str] = None,
         local_password: Optional[str] = None,
+        *,
+        limits: Optional[IceLimits] = None,
     ) -> None:
         super().__init__()
 
@@ -197,6 +199,7 @@ class RTCIceGatherer(AsyncIOEventEmitter):
             ice_controlling=False,
             local_username=local_username,
             local_password=local_password,
+            limits=limits,
             **ice_kwargs,
         )
         self._remote_candidates_end = False
@@ -262,6 +265,8 @@ class RTCIceTransport(AsyncIOEventEmitter):
         self.__iceGatherer = gatherer
         self.__monitor_task: Optional[asyncio.Future[None]] = None
         self.__start: Optional[asyncio.Event] = None
+        self.__start_task: Optional[asyncio.Task] = None
+        self.__stop_task: Optional[asyncio.Task[None]] = None
         self.__state = "new"
         self._connection = gatherer._connection
         self._role_set = False
@@ -276,6 +281,10 @@ class RTCIceTransport(AsyncIOEventEmitter):
         The ICE gatherer passed in the constructor.
         """
         return self.__iceGatherer
+
+    @property
+    def _has_write_limits(self) -> bool:
+        return self._connection._limits is not None
 
     @property
     def role(self) -> str:
@@ -333,6 +342,7 @@ class RTCIceTransport(AsyncIOEventEmitter):
             await self.__start.wait()
             return
         self.__start = asyncio.Event()
+        self.__start_task = asyncio.current_task()
         self.__monitor_task = asyncio.ensure_future(self._monitor())
 
         self.__setState("checking")
@@ -342,26 +352,38 @@ class RTCIceTransport(AsyncIOEventEmitter):
         try:
             await self._connection.connect()
         except ConnectionError:
-            self.__setState("failed")
+            if self.state != "closed":
+                self.__setState("failed")
         else:
-            self.__setState("completed")
-        self.__start.set()
+            if self.state != "closed":
+                self.__setState("completed")
+        finally:
+            self.__start.set()
+            self.__start_task = None
 
     async def stop(self) -> None:
         """
         Irreversibly stop the :class:`RTCIceTransport`.
         """
-        if self.state != "closed":
+        if self.__stop_task is None:
             self.__setState("closed")
-            await self._connection.close()
-            if self.__monitor_task is not None:
-                await self.__monitor_task
-                self.__monitor_task = None
+            self.__stop_task = asyncio.create_task(self.__stop(asyncio.current_task()))
+        await asyncio.shield(self.__stop_task)
+
+    async def __stop(self, caller: Optional[asyncio.Task]) -> None:
+        start_task = self.__start_task
+        if start_task is not None and start_task is not caller:
+            start_task.cancel()
+            await asyncio.gather(start_task, return_exceptions=True)
+        await self._connection.close()
+        if self.__monitor_task is not None:
+            await self.__monitor_task
+            self.__monitor_task = None
 
     async def _monitor(self) -> None:
         while True:
             event = await self._connection.get_event()
-            if isinstance(event, ConnectionClosed):
+            if event is None or isinstance(event, ConnectionClosed):
                 if self.state == "completed":
                     self.__setState("failed")
                 return

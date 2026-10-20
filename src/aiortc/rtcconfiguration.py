@@ -2,6 +2,27 @@ import enum
 from dataclasses import dataclass
 from typing import Optional, Union
 
+from aioice import IceLimits
+
+
+@dataclass(frozen=True)
+class SctpLimits:
+    """Optional per-association retained-storage limits."""
+
+    send_bytes: int = 64 * 1024 * 1024 + 4096
+    send_chunks: int = 65536
+    send_messages: int = 512
+    send_waiters: int = 64
+    receive_bytes: int = 4 * 1024 * 1024
+    receive_entries: int = 8192
+    active_streams: int = 16
+    max_message_size: int = 262144
+
+    def __post_init__(self) -> None:
+        for value in vars(self).values():
+            if type(value) is not int or value <= 0:
+                raise ValueError("SCTP limits must be positive integers")
+
 
 @dataclass
 class RTCIceServer:
@@ -67,3 +88,9 @@ class RTCConfiguration:
 
     alwaysNegotiateDataChannels: bool = False
     "Whether to always negotiate data channels in the SDP."
+
+    sctpLimits: Optional[SctpLimits] = None
+    "Optional SCTP retained-storage limits."
+
+    iceLimits: Optional[IceLimits] = None
+    "Optional direct ICE retained-storage limits."
